@@ -4,6 +4,8 @@ This is an **unofficial PyTorch implementation** of the ICCV 2025 paper [DAViD: 
 
 **Official Project Page:** https://microsoft.github.io/DAViD
 
+![Demo Results](output/demo_results.png)
+
 ## Model Architecture
 
 The implementation uses a multi-head DPT (Dense Prediction Transformer) architecture:
@@ -56,7 +58,7 @@ The demo will:
 
 
 
-![Demo Results](output/demo_results.png)
+
 
 **Note about the pre-trained model:** This model was trained using face/head images only (0000.zip ~ 0018.zip from the SynthHuman dataset, approximately 100k data samples). Body images were not included in training. The model was trained on one HPC with 4 RTX 4090 GPUs for a total of 26 hours.
 
