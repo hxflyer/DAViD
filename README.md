@@ -1,159 +1,160 @@
-# DAViD: Data-efficient and Accurate Vision Models from Synthetic Data
+# DAViD: Data-efficient and Accurate Vision Models from Synthetic Data (Unofficial Implementation)
 
-The repo accompanies the ICCV 2025 paper [DAViD: Data-efficient and Accurate Vision Models from Synthetic Data](https://microsoft.github.io/DAViD) and contains instructions for downloading and using the SynthHuman dataset and models described in the paper.
+This is an **unofficial PyTorch implementation** of the ICCV 2025 paper [DAViD: Data-efficient and Accurate Vision Models from Synthetic Data](https://microsoft.github.io/DAViD). This repository contains training code and inference scripts for multi-task human perception including depth estimation, surface normal estimation, and foreground segmentation.
 
-## 📊 The SynthHuman Dataset
+**Official Project Page:** https://microsoft.github.io/DAViD
 
-<img src="docs/img/SynthHuman-F.jpg" alt="Face Data" width="33%"/><img src="docs/img/SynthHuman-FB.jpg" alt="Full Body Data" width="33%"/><img src="docs/img/SynthHuman-UB.jpg" alt="Upper Body Data" width="33%"/>
+## Model Architecture
 
-The SynthHuman dataset contains approximately 300,000 images of synthetic humans with ground-truth annotations for foreground alpha masks, absolute depth, surface normals and camera intrinsics. There are approximately 100,000 images for each of three camera scenarios: face, upper-body and full-body. The data is generated using the latest version of our synthetic data generation pipeline, which has been used to create a number of datasets: [Face Synthetics](https://microsoft.github.io/FaceSynthetics/), [SimpleEgo](https://aka.ms/SimpleEgo) and [SynthMoCap](https://aka.ms/SynthMoCap). Ground-truth annotations are per-pixel with perfect accuracy due to the graphics-based rendering pipeline:
+The implementation uses a multi-head DPT (Dense Prediction Transformer) architecture:
 
-<img src="img/face_gt.jpg" alt="Face GT" width="49%"/> <img src="img/body_gt.jpg" alt="Full Body GT" width="49%"/>
+- **Backbone:** ViT-Base-16 (384×384 input)  
+- **Encoder:** Vision Transformer with DPT feature fusion
+- **Decoder:** Multi-task heads for depth, normals, and alpha prediction
+- **Features:** 256-dimensional feature maps
+- **Paper Architecture:** Uses the resizer + decoder block design from the paper
 
-### Data Format
+## Implementation Notes
 
-The dataset contains 298008 samples.
-There first 98040 samples feature the face, the next 99976 sample feature the full body and the final 99992 samples feature the upper body.
-Each sample is made up of:
+**Important:** The original DAViD repository does not provide training code or PyTorch model source code. This implementation was created based on the methodology and architecture described in the DAViD paper. This PyTorch implementation is **not compatible** with the ONNX model files provided in the official DAViD repository. The official ONNX models and this PyTorch implementation use different architectures and cannot be used interchangeably.
 
-- `rgb_0000000.png` - RGB image
-- `alpha_0000000.png` - foreground alpha mask
-- `depth_0000000.exr` - absolute z-depth image in cm
-- `normal_0000000.exr` - surface normal image (XYZ)
-- `cam_0000000.txt` - camera intrinsics (see below)
 
-The camera text file includes the standard intrinsic matrix:
+## Quick Start
 
-```
-f_x 0.0 c_x
-0.0 f_y c_y
-0.0 0.0 1.0
-```
-
-Where `f_x`, and `f_y` are in pixel units.
-This can be easily loaded with `np.loadtxt(path_to_camera_txt)`.
-
-### Downloading the Dataset
-
-The dataset is broken in 60 zip files to make downloading easier.
-Each zip file contains 5000 samples and has a maximum size of 8.75GB.
-The total download size is approximately 330GB.
-To download the dataset simply run `download_data.py TARGET_DIRECTORY [--single-sample] [--single-chunk]` which will download and unzip the zips into the target folder.
-You can optionally download a single sample or a single chunk to quickly take a look at the data.
-
-### Loading the Dataset
-
-You can visualize samples from the dataset using `visualize_data.py SYNTHHUMAN_DIRECTORY [--start-idx N]`.
-This script shows examples of how to load the image files correctly and display the data.
-
-### Dataset License
-
-The SynthHuman dataset is licensed under the [CDLA-2.0](./LICENSE-CDLA-2.0.txt).
-The download and visualization scripts are licensed under the [MIT License](./LICENSE-MIT.txt).
-
-## 🔓 Released Models
-
-We release models for the following tasks:
-<table>
-  <thead>
-    <tr>
-      <th>Task</th>
-      <th>Version</th>
-      <th>ONNX Model</th>
-      <th>Model Card</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td rowspan="2">Soft Foreground Segmentation</td>
-      <td>Base</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/foreground-segmentation-model-vitb16_384.onnx">Download</a></td>
-      <td rowspan="2"><a href="./model_cards/soft_foreground_segmentation_model.md">Model Card</a></td>
-    </tr>
-    <tr>
-      <td>Large</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/foreground-segmentation-model-vitl16_384.onnx">Download</a></td>
-    </tr>
-    <tr>
-      <td rowspan="2">Relative Depth Estimation</td>
-      <td>Base</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/depth-model-vitb16_384.onnx">Download</a></td>
-      <td rowspan="2"><a href="./model_cards/depth_model.md">Model Card</a></td>
-    </tr>
-    <tr>
-      <td>Large</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/depth-model-vitl16_384.onnx">Download</a></td>
-    </tr>
-    <tr>
-      <td rowspan="2">Surface Normal Estimation</td>
-      <td>Base</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/normal-model-vitb16_384.onnx">Download</a></td>
-      <td rowspan="2"><a href="./model_cards/surface_normal_model.md">Model Card</a></td>
-    </tr>
-    <tr>
-      <td>Large</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/normal-model-vitl16_384.onnx">Download</a></td>
-    </tr>
-    <tr>
-      <td rowspan="1">Multi-Task Model</td>
-            <td>Large</td>
-      <td><a href="https://facesyntheticspubwedata.z6.web.core.windows.net/iccv-2025/models/multi-task-model-vitl16_384.onnx">Download</a></td>
-      <td rowspan="1"><a href="./model_cards/multi_task_model.md">Model Card</a></td>
-    </tr>
-  </tbody>
-</table>
-
-## 🚀 Run the Demo
-
-This demo supports running:
-
-- Relative depth estimation
-- Soft foreground segmentation
-- Surface normal estimation
-
-To install the requirements for running demo:
+### Installation
 
 ```bash
 pip install -r requirement.txt
 ```
 
-You can use either run:
+### Download Pre-trained Model
 
-1. A multi-task model that performs all tasks simultaneously
+Download the pre-trained model weights from Google Drive and place them in the `models/` directory:
 
-```bash
-python demo.py \
-  --image path/to/input.jpg \
-  --multitask-model models/multitask.onnx
-```
-
-2. Or using individual models
+**Model Download:** [checkpoint_epoch_155.pth](https://drive.google.com/file/d/16uSXh18idxN4bbbr8ZXUYqk9MptWIUDQ/view?usp=sharing)
 
 ```bash
-python demo.py \
-  --image path/to/input.jpg \
-  --depth-model models/depth.onnx \
-  --foreground-model models/foreground.onnx \
-  --normal-model models/normal.onnx
+# Create models directory
+mkdir -p models/
+
+# Place the downloaded checkpoint_epoch_155.pth file in models/
+# models/checkpoint_epoch_155.pth
 ```
 
-🧠 **Notes:**
+### Run Demo
 
-- The script expects ONNX models. Ensure the model paths are correct.
-- If both multi-task and individual models are provided, results from both will be shown and compared.
-- Foreground masks are used for improved visualization of depth and normals.
+Simply run the demo script to test the model on the sample images:
 
-Here is an example output image after running the demo:
+```bash
+python demo.py
+```
 
-![Example results](img/demo_result.png)
+The demo will:
+- Load 4 sample images from `img/` directory  
+- Run multi-task inference (depth, normals, foreground segmentation)
+- Save visualization results to `output/demo_results.png`
 
-### Model License
 
-DAViD models and runtime code are licensed under the [MIT License](./LICENSE-MIT.txt).
 
-## 📖 Citation
+![Demo Results](output/demo_results.png)
 
-If you use the SynthHuman Dataset or any of the DAViD models in your research, please cite the following:
+**Note about the pre-trained model:** This model was trained using face/head images only (0000.zip ~ 0018.zip from the SynthHuman dataset, approximately 100k data samples). Body images were not included in training. The model was trained on one HPC with 4 RTX 4090 GPUs for a total of 26 hours.
+
+
+
+## Training
+
+### Dataset Preparation
+
+1. **Download the SynthHuman dataset** from the [official DAViD project page](https://microsoft.github.io/DAViD)
+
+2. **Extract and organize the dataset:**
+   ```bash
+   # Example directory structure
+   /path/to/dataset/SynthHuman_0000/
+   ├── rgb_0000000.png
+   ├── alpha_0000000.png  
+   ├── depth_0000000.exr
+   ├── normal_0000000.exr
+   ├── cam_0000000.txt
+   └── ...
+   ```
+
+3. **Update dataset paths** in the training scripts:
+   - Edit `data_roots` in `train.py` or `linux_train.py`
+   - Point to your downloaded SynthHuman directories
+
+### Single GPU Training
+
+For single GPU training, use `train.py`:
+
+```bash
+python train.py
+```
+
+**Key configurations in train.py:**
+- **Data paths:** Update `data_roots` list with your dataset directories
+- **Batch size:** 16 (adjust based on GPU memory)
+- **Learning rate:** 2e-4 with separate rates for backbone (0.1x) and heads (1x)
+- **FP16 training:** Enabled by default for memory efficiency
+- **Epochs:** 50 (adjust as needed)
+
+**Training features:**
+- Multi-task loss combining depth, surface normals, and alpha prediction
+- Scale-shift depth alignment for robust depth estimation
+- Progressive learning rate scheduling
+- Automatic checkpoint saving and best model tracking
+- Sample visualization during training
+
+### Multi-GPU Training (Linux)
+
+For distributed training on multiple GPUs, use `linux_train.py`:
+
+```bash
+python linux_train.py
+```
+
+**Multi-GPU configurations:**
+- **Batch size per GPU:** 24 (total effective batch size: 96 for 4 GPUs)
+- **Data parallel:** Uses DistributedDataParallel (DDP)
+- **Automatic synchronization:** Loss averaging across GPUs
+- **Robust error handling:** Continues training even if some operations fail
+- **Checkpoint management:** Saves to shared storage location
+
+### Training Tips
+
+1. **Memory Management:**
+   - Enable FP16 training to reduce memory usage
+   - Adjust batch size based on your GPU memory
+   - Use gradient accumulation for larger effective batch sizes
+
+2. **Dataset Loading:**
+   - The dataset loader automatically handles EXR files (depth/normals)
+   - Supports multiple dataset directories for larger datasets
+   - Includes data augmentation (horizontal flip, color jitter)
+
+3. **Loss Function:**
+   - **Depth Loss:** Scale-shift invariant + direct supervision
+   - **Normal Loss:** Cosine similarity with masking
+   - **Alpha Loss:** BCE + L1 + Dice loss combination
+
+4. **Monitoring:**
+   - Training samples are saved periodically to `training_samples/`
+   - Checkpoints saved every 5 epochs
+   - Best model tracked based on validation loss
+
+### Resume Training
+
+To resume from a checkpoint:
+
+```bash
+python train.py --load_pretrained path/to/checkpoint.pth
+```
+
+
+## Citation
+
+If you use this implementation in your research, please cite the original paper:
 
 ```bibtex
 @misc{saleh2025david,

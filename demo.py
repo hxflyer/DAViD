@@ -1,256 +1,346 @@
-"""Demo script for depth estimation, foreground segmentation, and surface normal estimation.
-
-Copyright (c) Microsoft Corporation.
-
-MIT License
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED *AS IS*, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+"""
+Demo script to run the trained multi-task model checkpoint with samples from img/ directory.
+Uses the same approach as vis_util.py with ground truth data loaded from img/.
 """
 
-import argparse
+import torch
+import torch.nn.functional as F
 import os
-import sys
-from typing import Optional
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "runtime"))
-
-import cv2
 import numpy as np
-from depth_estimator import RelativeDepthEstimator
-from multi_task_estimator import MultiTaskEstimator
-from soft_foreground_segmenter import SoftForegroundSegmenter
-from surface_normal_estimator import SurfaceNormalEstimator
-from visualize import (
-    create_concatenated_display,
-    visualize_foreground,
-    visualize_normal_maps,
-    visualize_relative_depth_map,
-)
+import matplotlib.pyplot as plt
+from PIL import Image
+import cv2
+import glob
+import OpenEXR
+import Imath
+
+# Import model architecture
+from multi_head_dpt import create_multi_head_dpt
+from vis_util import align_depth_for_visualization
+
+
+def load_model_checkpoint(checkpoint_path, device='cuda'):
+    """
+    Load the trained multi-task model from checkpoint.
+    """
+    # Create the model architecture
+    model = create_multi_head_dpt(
+        backbone="vitb16_384",
+        features=256,
+        use_bn=False,
+        pretrained=True
+    )
+    
+    # Load checkpoint
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Extract model state dict (handle different checkpoint formats)
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+        epoch = checkpoint.get('epoch', 'unknown')
+        print(f"Loaded model from epoch: {epoch}")
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    else:
+        # Assume the entire checkpoint is the state dict
+        state_dict = checkpoint
+    
+    # Handle DDP wrapped models (remove 'module.' prefix if present)
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('module.'):
+            new_key = key[7:]  # Remove 'module.' prefix
+        else:
+            new_key = key
+        new_state_dict[new_key] = value
+    
+    # Load weights into model
+    model.load_state_dict(new_state_dict, strict=True)
+    model.to(device)
+    model.eval()
+    
+    print("✅ Model loaded successfully!")
+    return model
+
+
+def load_exr_file(filepath):
+    """Load EXR file using OpenEXR."""
+    try:
+        exr_file = OpenEXR.InputFile(filepath)
+        header = exr_file.header()
+        
+        # Get image dimensions
+        dw = header['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        
+        # Get available channels
+        channels = list(header['channels'].keys())
+        FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
+        
+        if 'Y' in channels:
+            # Depth file - single Y channel
+            channel_data = exr_file.channel('Y', FLOAT)
+            data = np.frombuffer(channel_data, dtype=np.float32)
+            data = data.reshape((height, width))
+            
+        elif all(c in channels for c in ['R', 'G', 'B']):
+            # Normal file - RGB channels
+            r_data = exr_file.channel('R', FLOAT)
+            g_data = exr_file.channel('G', FLOAT)
+            b_data = exr_file.channel('B', FLOAT)
+            
+            r = np.frombuffer(r_data, dtype=np.float32).reshape((height, width))
+            g = np.frombuffer(g_data, dtype=np.float32).reshape((height, width))
+            b = np.frombuffer(b_data, dtype=np.float32).reshape((height, width))
+            
+            data = np.stack([r, g, b], axis=2)  # [H, W, 3]
+            
+        else:
+            raise ValueError(f"Unsupported EXR channels: {channels}")
+        
+        exr_file.close()
+        return data
+        
+    except Exception as e:
+        print(f"❌ Error loading EXR file {filepath}: {e}")
+        return None
+
+
+def load_samples_from_img_dir(img_dir="img", target_size=384):
+    """
+    Load 4 samples from img/ directory.
+    
+    Args:
+        img_dir: Directory containing the sample files
+        target_size: Target image size for model input
+        
+    Returns:
+        List of sample dictionaries with 'rgb', 'depth', 'normals', 'alpha'
+    """
+    print(f"📊 Loading samples from: {img_dir}")
+    
+    # Find all sample files
+    rgb_files = sorted(glob.glob(os.path.join(img_dir, "sample_*_rgb.png")))
+    print(f"📈 Found {len(rgb_files)} samples")
+    
+    samples = []
+    for rgb_file in rgb_files:
+        # Extract sample name (e.g., "sample_01_0000428")
+        sample_name = os.path.basename(rgb_file).replace("_rgb.png", "")
+        
+        # Define file paths
+        depth_file = os.path.join(img_dir, f"{sample_name}_depth.exr")
+        normal_file = os.path.join(img_dir, f"{sample_name}_normal.exr")
+        alpha_file = os.path.join(img_dir, f"{sample_name}_alpha.png")
+        
+        
+        # Load RGB
+        rgb_image = Image.open(rgb_file).convert('RGB')
+        rgb_image = rgb_image.resize((target_size, target_size), Image.LANCZOS)
+        rgb_np = np.array(rgb_image).astype(np.float32) / 255.0
+        rgb_tensor = torch.from_numpy(rgb_np.transpose(2, 0, 1))  # [3, H, W]
+        
+        # Load depth EXR
+        depth_np = load_exr_file(depth_file)
+
+        depth_np = cv2.resize(depth_np, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        
+        # Process depth: normalize to [0, 1] range (same as dataset processing)
+        depth_valid = depth_np > 0
+        if depth_valid.any():
+            depth_clipped = np.clip(depth_np, 0, 300.0)  # Cap at 5 meters
+            depth_min = 50.0   # 50cm minimum
+            depth_max = 300.0  # 5m maximum
+            depth_normalized = (depth_clipped - depth_min) / (depth_max - depth_min)
+            depth_normalized = np.clip(depth_normalized, 0, 1)
+            depth_np = np.where(depth_valid, depth_normalized, 0)
+        depth_tensor = torch.from_numpy(depth_np).float()
+        
+        # Load normals EXR
+        normals_np = load_exr_file(normal_file)
+        normals_np = cv2.resize(normals_np, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+        
+        # Normalize normals to unit vectors
+        norm = np.linalg.norm(normals_np, axis=2, keepdims=True)
+        norm = np.where(norm > 0, norm, 1.0)
+        normals_np = normals_np / norm
+        normals_tensor = torch.from_numpy(normals_np.transpose(2, 0, 1)).float()  # [3, H, W]
+        
+        # Load alpha
+        alpha_image = Image.open(alpha_file).convert('L')
+        alpha_image = alpha_image.resize((target_size, target_size), Image.LANCZOS)
+        alpha_np = np.array(alpha_image).astype(np.float32) / 255.0
+        alpha_tensor = torch.from_numpy(alpha_np).unsqueeze(0).float()  # [1, H, W]
+        
+        sample = {
+            'rgb': rgb_tensor,
+            'depth': depth_tensor,
+            'normals': normals_tensor,
+            'alpha': alpha_tensor,
+            'sample_name': sample_name
+        }
+        samples.append(sample)
+        
+        print(f"  ✅ Loaded {sample_name}")
+    
+    print(f"📊 Successfully loaded {len(samples)} samples from {img_dir}")
+    return samples
+
+
+def save_inference_results(model, samples, device, output_dir="output"):
+    """
+    Save inference results using the same approach as vis_util.py.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    model.eval()
+    with torch.no_grad():
+        # Prepare batch data
+        batch_rgb = torch.stack([sample['rgb'] for sample in samples]).to(device)
+        
+        # Create batch dict
+        batch = {
+            'rgb': batch_rgb,
+            'depth': torch.stack([sample['depth'] for sample in samples]),
+            'normals': torch.stack([sample['normals'] for sample in samples]),
+            'alpha': torch.stack([sample['alpha'] for sample in samples])
+        }
+        
+        # Get model predictions
+        outputs = model(batch_rgb)
+        
+        # Create figure with same layout as vis_util.py: 4 samples x 7 columns
+        fig, axes = plt.subplots(4, 7, figsize=(21, 12))
+        
+        # Process each sample
+        for row in range(len(samples)):
+            sample_name = samples[row]['sample_name']
+            
+            # RGB
+            rgb_vis = batch['rgb'][row].cpu().numpy().transpose(1, 2, 0)
+            rgb_vis = np.clip(rgb_vis, 0, 1)
+            axes[row, 0].imshow(rgb_vis)
+            axes[row, 0].axis('off')
+            if row == 0:
+                axes[row, 0].set_title("RGB", fontsize=10)
+            
+            # Add sample label
+            axes[row, 0].text(-0.1, 0.5, sample_name, rotation=90, va='center', ha='center', 
+                            transform=axes[row, 0].transAxes, fontsize=10, fontweight='bold')
+            
+            # Depth GT and Pred with scale-shift alignment
+            depth_gt = batch['depth'][row].cpu().numpy().squeeze()
+            depth_pred_raw = outputs['depth'][row].cpu().numpy()
+            
+            # Get GT alpha mask ONLY for depth alignment
+            alpha_gt = batch['alpha'][row].cpu().numpy().squeeze()
+            if alpha_gt.ndim == 3 and alpha_gt.shape[0] == 1:
+                alpha_gt = alpha_gt.squeeze(0)
+            
+            # Get predicted alpha mask for visualization masking
+            alpha_pred = torch.sigmoid(outputs['alpha_logits'][row]).cpu().numpy()
+            
+            # Apply depth alignment using GT alpha
+            depth_pred_aligned = align_depth_for_visualization(depth_pred_raw, depth_gt, alpha_gt)
+            
+            # Apply masked visualization using PREDICTED alpha
+            depth_masked_vis = alpha_pred * depth_pred_aligned + (1 - alpha_pred) * depth_gt
+            
+            # Use 'turbo' colormap for much better contrast and perceptual uniformity
+            axes[row, 1].imshow(depth_gt, cmap='turbo')
+            axes[row, 1].axis('off')
+            if row == 0:
+                axes[row, 1].set_title("Depth GT", fontsize=10)
+                
+            axes[row, 2].imshow(depth_masked_vis, cmap='turbo')
+            axes[row, 2].axis('off')
+            if row == 0:
+                axes[row, 2].set_title("Depth Pred", fontsize=10)
+            
+            # Normals GT and Pred
+            normals_gt = batch['normals'][row].cpu().numpy().transpose(1, 2, 0)
+            normals_pred = outputs['normals'][row].cpu().numpy().transpose(1, 2, 0)
+            
+            # Normalize both GT and predicted normals to unit vectors
+            normals_gt_norm = np.linalg.norm(normals_gt, axis=2, keepdims=True)
+            normals_gt_norm = np.where(normals_gt_norm > 0, normals_gt_norm, 1.0)
+            normals_gt_normalized = normals_gt / normals_gt_norm
+            
+            normals_pred_norm = np.linalg.norm(normals_pred, axis=2, keepdims=True)
+            normals_pred_norm = np.where(normals_pred_norm > 0, normals_pred_norm, 1.0)
+            normals_pred_normalized = normals_pred / normals_pred_norm
+            
+            # Convert to visualization format [0, 1]
+            normals_gt_vis = np.clip((normals_gt_normalized + 1) / 2, 0, 1)
+            normals_pred_vis = np.clip((normals_pred_normalized + 1) / 2, 0, 1)
+            
+            # Apply masked visualization using PREDICTED alpha
+            alpha_pred_3ch = np.stack([alpha_pred] * 3, axis=2)
+            normals_masked_vis = alpha_pred_3ch * normals_pred_vis + (1 - alpha_pred_3ch) * normals_gt_vis
+            
+            axes[row, 3].imshow(normals_gt_vis)
+            axes[row, 3].axis('off')
+            if row == 0:
+                axes[row, 3].set_title("Normals GT", fontsize=10)
+                
+            axes[row, 4].imshow(normals_masked_vis)
+            axes[row, 4].axis('off')
+            if row == 0:
+                axes[row, 4].set_title("Normals Pred", fontsize=10)
+            
+            # Alpha GT and Pred
+            alpha_gt_vis = batch['alpha'][row].cpu().numpy().squeeze()
+            if alpha_gt_vis.ndim == 3 and alpha_gt_vis.shape[0] == 1:
+                alpha_gt_vis = alpha_gt_vis.squeeze(0)
+            
+            axes[row, 5].imshow(alpha_gt_vis, cmap='gray', vmin=0, vmax=1)
+            axes[row, 5].axis('off')
+            if row == 0:
+                axes[row, 5].set_title("Alpha GT", fontsize=10)
+                
+            axes[row, 6].imshow(alpha_pred, cmap='gray', vmin=0, vmax=1)
+            axes[row, 6].axis('off')
+            if row == 0:
+                axes[row, 6].set_title("Alpha Pred", fontsize=10)
+        
+        # Same layout as vis_util.py
+        plt.subplots_adjust(wspace=0.02, hspace=0.02)
+        
+        # Save results
+        result_path = os.path.join(output_dir, 'demo_results.png')
+        plt.savefig(result_path, dpi=150, bbox_inches='tight', pad_inches=0.1)
+        plt.close()
+        
+    
+    return result_path
 
 
 def main():
-    """Main function to run the demo."""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description="Demo script for depth estimation, foreground segmentation, and surface normal estimation"
-    )
-    parser.add_argument("--image", required=True, help="Path to input image")
-
-    # Multi-task model path
-    parser.add_argument(
-        "--multitask-model",
-        type=str,
-        help="Path to multi-task ONNX model that handles all tasks",
-    )
-
-    # Individual model paths (if using individual models)
-    parser.add_argument("--depth-model", help="Path to depth estimation ONNX model")
-    parser.add_argument(
-        "--foreground-model", help="Path to foreground segmentation ONNX model"
-    )
-    parser.add_argument(
-        "--normal-model", help="Path to surface normal estimation ONNX model"
-    )
-
-    parser.add_argument("--output_path", help="Save result to a path (optional)")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run without displaying GUI (useful for headless servers)",
-    )
-
-    args = parser.parse_args()
-
-    if not os.path.exists(args.image):
-        print(f"Error: Image not found: {args.image}")
+    checkpoint_path = 'models/checkpoint_epoch_155.pth'
+    img_dir = 'img'
+    output_dir = 'output'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    print(f"🚀 Running demo on device: {device}")
+    
+    # Load model
+    try:
+        model = load_model_checkpoint(checkpoint_path, device=device)
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
         return
+    
+    samples = load_samples_from_img_dir(img_dir, target_size=384)
 
-    multitask_available = args.multitask_model and os.path.exists(args.multitask_model)
-    depth_available = args.depth_model and os.path.exists(args.depth_model)
-    foreground_available = args.foreground_model and os.path.exists(
-        args.foreground_model
-    )
-    normal_available = args.normal_model and os.path.exists(args.normal_model)
-
-    if not (
-        multitask_available
-        or depth_available
-        or foreground_available
-        or normal_available
-    ):
-        print("Error: At least one model must be provided and exist.")
-        print("Available options:")
-        print("  --multitask-model: Multi-task model for all tasks")
-        print("  --depth-model: Individual depth estimation model")
-        print("  --foreground-model: Individual foreground segmentation model")
-        print("  --normal-model: Individual surface normal estimation model")
-        return
-
-    if args.output_path and not os.path.exists(args.output_path):
-        os.makedirs(args.output_path, exist_ok=True)
-
-    image = cv2.imread(args.image)
-    if image is None:
-        print(f"Error: Could not read the image from {args.image}")
-        return
-
-    results = {}
-
-    has_individual_models = (
-        (args.depth_model and os.path.exists(args.depth_model))
-        or (args.foreground_model and os.path.exists(args.foreground_model))
-        or (args.normal_model and os.path.exists(args.normal_model))
-    )
-
-    if has_individual_models:
-        print("Using individual models...")
-        results["individual"] = process_with_individual_models(
-            image, args.depth_model, args.foreground_model, args.normal_model
-        )
-    if args.multitask_model:
-        print("Using multi-task model...")
-        results["multitask"] = process_with_multitask_model(image, args.multitask_model)
-
-    display_results(image, results, args.output_path, args.headless)
-
-
-def process_with_individual_models(
-    image: np.ndarray,
-    depth_model: Optional[str] = None,
-    foreground_model: Optional[str] = None,
-    normal_model: Optional[str] = None,
-):
-    """Process image using individual models for each task."""
-    results = {}
-
-    if depth_model:
-        print("Estimating depth map...")
-        depth_estimator = RelativeDepthEstimator(
-            onnx_model=depth_model, is_inverse=True
-        )
-        results["depth"] = depth_estimator.estimate_relative_depth(image)
-
-    if foreground_model:
-        print("Estimating foreground segmentation...")
-        foreground_segmenter = SoftForegroundSegmenter(onnx_model=foreground_model)
-        results["foreground"] = foreground_segmenter.estimate_foreground_segmentation(
-            image
-        )
-
-    if normal_model:
-        print("Estimating surface normals...")
-        normal_estimator = SurfaceNormalEstimator(onnx_model=normal_model)
-        results["normal"] = normal_estimator.estimate_normal(image)
-
-    return results
-
-
-def process_with_multitask_model(image: np.ndarray, multi_task: bool):
-    """Process image using multi-task model."""
-    multitask_estimator = MultiTaskEstimator(
-        onnx_model=multi_task, is_inverse_depth=False
-    )
-    return multitask_estimator.estimate_all_tasks(image)
-
-
-def display_results(
-    image: np.ndarray,
-    results: dict[str, np.ndarray],
-    output_path: Optional[str] = None,
-    headless: bool = False,
-):
-    """Display results."""
-    if "individual" in results:
-        individual_result = display_single_model_results(
-            image, results["individual"], prefix="Individual"
-        )
-        if output_path:
-            cv2.imwrite(
-                os.path.join(output_path, "individual_results.png"),
-                individual_result,
-            )
-    if "multitask" in results:
-        print("Displaying multi-task model results...")
-        multitask_results = results["multitask"]
-        multitask_result = display_single_model_results(
-            image, multitask_results, prefix="Multi-task"
-        )
-        if output_path:
-            cv2.imwrite(
-                os.path.join(output_path, "multitask_results.png"),
-                multitask_result,
-            )
-
-    if "individual" in results and "multitask" in results:
-        if len(results["individual"]) == len(results["multitask"]):
-            compare_results = cv2.vconcat([individual_result, multitask_result])
-            if output_path:
-                cv2.imwrite(
-                    os.path.join(output_path, "comparison_results.png"),
-                    compare_results,
-                )
-
-    if not headless:
-        if (
-            "individual" in results
-            and "multitask" in results
-            and len(results["individual"]) == len(results["multitask"])
-        ):
-            cv2.imshow("Comparison: Individual vs Multi-task", compare_results)
-        if "individual" in results:
-            cv2.imshow("Individual Model Results", individual_result)
-        if "multitask" in results:
-            cv2.imshow("Multi-task Model Results", multitask_result)
-
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-
-def display_single_model_results(image, model_results, prefix=""):
-    """Display results from a single model (individual or multitask)."""
-    visualizations = [image]
-    labels = ["Original"]
-
-    foreground_mask = model_results.get("foreground")
-
-    if "depth" in model_results:
-        depth_vis = visualize_relative_depth_map(
-            image, model_results["depth"], foreground_mask
-        )
-        visualizations.append(depth_vis)
-        labels.append(f"{prefix}/Depth")
-
-    if "foreground" in model_results:
-        foreground_vis = visualize_foreground(image, model_results["foreground"])
-        visualizations.append(foreground_vis)
-        labels.append(f"{prefix}/Foreground")
-
-    if "normal" in model_results:
-        normal_vis = visualize_normal_maps(
-            image, model_results["normal"], foreground_mask
-        )
-        visualizations.append(normal_vis)
-        labels.append(f"{prefix}/Normals")
-
-    result = create_concatenated_display(visualizations, labels, downscale=2)
-
-    return result
+    result_path = save_inference_results(model, samples, device, output_dir)
+    
+    print(f"\n🎯 Inference completed successfully!")
+    print(f"📸 Results saved to: {result_path}")
 
 
 if __name__ == "__main__":

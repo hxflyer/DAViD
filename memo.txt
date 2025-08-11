@@ -1,0 +1,20 @@
+watch -n 1 nvidia-smi
+
+cp G:/SynthHuman_zip/SynthHuman_0013.zip oss://
+
+ssh -p 34839 root@i-2.gpushare.com
+KU5mk8wgFNHwgsAdQWCev9qDsQ6eRWfK
+
+# Start a new screen session
+screen -S training
+
+# Run your training
+torchrun --nproc_per_node=4 linux_train.py
+
+# Detach from screen: Press Ctrl+A, then D
+
+# Reattach later from any SSH session
+screen -r training
+
+# List all screen sessions
+screen -ls
