@@ -25,7 +25,8 @@ from david_dataset import create_dataloaders
 from loss import (
     compute_robust_depth_loss,
     compute_surface_normal_loss,
-    compute_alpha_loss
+    compute_alpha_loss,
+    TRITON_AVAILABLE  # Import Triton detection
 )
 from vis_util import save_sample_results
 
@@ -244,6 +245,26 @@ def train_worker(rank, world_size, load_pretrained=None):
         print(f"[Rank {rank}] ✅ Model created, moving to device {device}")
         model = model.to(device)
         print(f"[Rank {rank}] ✅ Model moved to device successfully")
+        
+        # Model compilation for performance optimization (before DDP wrapping)
+        if rank == 0:
+            print(f"🔥 Triton compilation available: {TRITON_AVAILABLE}")
+        
+        if TRITON_AVAILABLE:
+            if rank == 0:
+                print("⚡ Compiling model with torch.compile for speed optimization...")
+            try:
+                # Compile model for training - use reduce-overhead mode for training loops
+                model = torch.compile(model, mode="reduce-overhead")
+                if rank == 0:
+                    print("✅ Model compiled successfully!")
+            except Exception as e:
+                if rank == 0:
+                    print(f"⚠️  Model compilation failed: {e}")
+                    print("   Continuing with uncompiled model...")
+        else:
+            if rank == 0:
+                print("📱 Triton not available - using optimized loss functions without model compilation")
         
     except Exception as e:
         print(f"[Rank {rank}] ❌ Failed to create model: {e}")

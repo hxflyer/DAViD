@@ -20,7 +20,8 @@ from david_dataset import create_dataloaders
 from loss import (
     compute_robust_depth_loss,
     compute_surface_normal_loss,
-    compute_alpha_loss
+    compute_alpha_loss,
+    TRITON_AVAILABLE  # Import Triton detection
 )
 from vis_util import save_sample_results
 
@@ -74,6 +75,20 @@ def train_model(load_pretrained=None):
         pretrained=True
     )
     model = model.to(device)
+    
+    # Model compilation for performance optimization
+    print(f"🔥 Triton compilation available: {TRITON_AVAILABLE}")
+    if TRITON_AVAILABLE:
+        print("⚡ Compiling model with torch.compile for speed optimization...")
+        try:
+            # Compile model for training - use reduce-overhead mode for training loops
+            model = torch.compile(model, mode="reduce-overhead")
+            print("✅ Model compiled successfully!")
+        except Exception as e:
+            print(f"⚠️  Model compilation failed: {e}")
+            print("   Continuing with uncompiled model...")
+    else:
+        print("📱 Running on Windows - using optimized loss functions without compilation")
     
     # Load pretrained model if specified
     start_epoch = 0

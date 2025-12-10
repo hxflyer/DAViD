@@ -1,6 +1,6 @@
 """
 Loss Functions for Multi-task DPT Training
-Contains all loss functions for depth, surface normals, and alpha prediction
+Cleaned up version with single optimized depth loss implementation
 """
 
 import torch
@@ -31,18 +31,42 @@ def compute_masked_mse_loss(pred, target, mask):
     return mse
 
 
-def compute_scale_shift_invariant_depth_loss(pred_depth, gt_depth, mask):
+def compute_scale_shift_invariant_depth_loss_optimized(pred_depth, gt_depth, mask, stride=2, use_fp16=True):
     """
-    Numerically stable scale-shift invariant depth loss with explosion protection.
-    Prevents training explosions through scale clamping and robust computation.
+    Optimized scale-shift invariant depth loss with:
+    - Stride=2 sampling for minimal accuracy loss
+    - FP16 precision for parameter estimation
+    - Full resolution final loss computation
+    
+    Args:
+        pred_depth: Predicted depth [B, H, W]
+        gt_depth: Ground truth depth [B, H, W]
+        mask: Valid pixel mask [B, H, W]
+        stride: Stride for subsampling (default: 2)
+        use_fp16: Use FP16 for parameter estimation (default: True)
+    
+    Returns:
+        Scale-shift invariant loss
     """
     B, H, W = pred_depth.shape
     device = pred_depth.device
     
-    # Flatten everything for vectorized processing [B, H*W]
-    pred_flat = pred_depth.view(B, -1)
-    gt_flat = gt_depth.view(B, -1)
-    mask_flat = mask.view(B, -1).float()
+    # Stride=2 sampling for better accuracy/speed trade-off
+    pred_strided = pred_depth[:, ::stride, ::stride]  # [B, H//2, W//2]
+    gt_strided = gt_depth[:, ::stride, ::stride]
+    mask_strided = mask[:, ::stride, ::stride]
+    
+    # Convert to FP16 for parameter estimation if enabled
+    if use_fp16:
+        pred_flat = pred_strided.reshape(B, -1).half()
+        gt_flat = gt_strided.reshape(B, -1).half()
+        mask_flat = mask_strided.reshape(B, -1).half()
+        eps = torch.tensor(1e-4, device=device, dtype=torch.half)
+    else:
+        pred_flat = pred_strided.reshape(B, -1).float()
+        gt_flat = gt_strided.reshape(B, -1).float()
+        mask_flat = mask_strided.reshape(B, -1).float()
+        eps = 1e-6
     
     # Count valid pixels per sample [B]
     num_valid = torch.sum(mask_flat, dim=1)
@@ -52,95 +76,195 @@ def compute_scale_shift_invariant_depth_loss(pred_depth, gt_depth, mask):
     if not torch.any(valid_samples):
         return torch.tensor(0.0, device=device, requires_grad=True)
     
-    # Compute all statistics in one go using broadcasting [B]
+    # Compute all statistics [B]
     sum_pred = torch.sum(pred_flat * mask_flat, dim=1)
     sum_gt = torch.sum(gt_flat * mask_flat, dim=1) 
     sum_pred2 = torch.sum(pred_flat * pred_flat * mask_flat, dim=1)
     sum_pred_gt = torch.sum(pred_flat * gt_flat * mask_flat, dim=1)
     sum_mask = num_valid
     
-    # Solve 2x2 system using Cramer's rule for all samples simultaneously [B]
-    # System: [sum_pred2  sum_pred ] [scale] = [sum_pred_gt]
-    #         [sum_pred   sum_mask ] [shift]   [sum_gt     ]
+    # Solve 2x2 system using Cramer's rule
     det = sum_pred2 * sum_mask - sum_pred * sum_pred
-    
-    # More robust epsilon for numerical stability
-    eps = 1e-6
     
     # Compute scale and shift using Cramer's rule [B]
     scale = (sum_pred_gt * sum_mask - sum_gt * sum_pred) / (det + eps)
     shift = (sum_pred2 * sum_gt - sum_pred * sum_pred_gt) / (det + eps)
     
+    # Convert back to FP32 for final computation
+    scale = scale.float()
+    shift = shift.float()
+    
     # Enhanced numerical stability checks
-    valid_det = torch.abs(det) > 1e-5  # Stricter threshold
+    if use_fp16:
+        valid_det = torch.abs(det.float()) > 1e-4
+    else:
+        valid_det = torch.abs(det) > 1e-5
     
-    # CRITICAL FIX: Clamp scale to reasonable bounds to prevent explosion
-    scale = torch.clamp(scale, min=0.1, max=10.0)  # Reasonable scale bounds
+    scale = torch.clamp(scale, min=0.1, max=10.0)
     
-    # Handle degenerate cases: if det is too small, use identity transformation
+    # Handle degenerate cases
     scale = torch.where(valid_det, scale, torch.ones_like(scale))
     shift = torch.where(valid_det, shift, torch.zeros_like(shift))
     
-    # Additional safety: Check for NaN/Inf in scale/shift
+    # Safety checks for NaN/Inf
     scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
     shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
     
-    # Apply alignment to entire batch [B, H*W]
-    scale_expanded = scale.unsqueeze(1)  # [B, 1]
-    shift_expanded = shift.unsqueeze(1)  # [B, 1]
-    pred_aligned = pred_flat * scale_expanded + shift_expanded
+    # Apply alignment to FULL RESOLUTION for final loss computation (in FP32)
+    pred_full_flat = pred_depth.view(B, -1)  # [B, H*W]
+    gt_full_flat = gt_depth.view(B, -1)
+    mask_full_flat = mask.view(B, -1).float()
     
-    # Safety check: clamp aligned predictions to reasonable depth range
-    pred_aligned = torch.clamp(pred_aligned, min=0.01, max=1000.0)  # Reasonable depth bounds
+    # Expand scale/shift to full resolution [B, 1] -> [B, H*W]
+    scale_expanded = scale.unsqueeze(1)
+    shift_expanded = shift.unsqueeze(1)
+    pred_aligned = pred_full_flat * scale_expanded + shift_expanded
     
-    # Compute MSE for all samples simultaneously [B]
-    diff_sq = (pred_aligned - gt_flat) ** 2 * mask_flat
-    sample_losses = torch.sum(diff_sq, dim=1) / (sum_mask + 1e-8)
+    # Safety clamp for aligned predictions
+    pred_aligned = torch.clamp(pred_aligned, min=0.01, max=1000.0)
     
-    # Final safety: clamp individual losses to prevent explosion
-    sample_losses = torch.clamp(sample_losses, max=100.0)  # Cap individual sample losses
+    # Compute MSE on full resolution [B]
+    diff_sq = (pred_aligned - gt_full_flat) ** 2 * mask_full_flat
+    valid_pixels_full = torch.sum(mask_full_flat, dim=1)
+    sample_losses = torch.sum(diff_sq, dim=1) / (valid_pixels_full + 1e-8)
     
-    # Only average over samples with sufficient valid pixels
+    # Final safety checks
+    sample_losses = torch.clamp(sample_losses, max=100.0)
+    
+    # Average over valid samples
     valid_losses = sample_losses[valid_samples]
     final_loss = torch.mean(valid_losses) if len(valid_losses) > 0 else torch.tensor(0.0, device=device, requires_grad=True)
     
-    # Ultimate safety: ensure loss is finite and reasonable
+    # Ultimate safety
     if torch.isnan(final_loss) or torch.isinf(final_loss) or final_loss > 50.0:
-        return torch.tensor(1.0, device=device, requires_grad=True)  # Fallback loss
+        return torch.tensor(1.0, device=device, requires_grad=True)
     
     return final_loss
 
 
-def compute_robust_depth_loss(pred_depth, gt_depth, mask, use_direct_loss=False, direct_weight=0.1):
+# Test if torch.compile actually works with a simple function
+def _test_compile():
+    """Test if torch.compile works properly."""
+    try:
+        @torch.compile(mode="reduce-overhead")
+        def _test_fn(x):
+            return x * 2
+        
+        # Try to actually run it
+        x = torch.tensor([1.0])
+        result = _test_fn(x)
+        return True
+    except Exception:
+        return False
+
+# Detect Triton availability by actually testing compilation
+TRITON_AVAILABLE = _test_compile()
+
+if TRITON_AVAILABLE:
+    # Linux: Create compiled version with Triton support
+    @torch.compile(mode="reduce-overhead")
+    def compute_scale_shift_invariant_depth_loss_compiled(pred_depth, gt_depth, mask, stride=2):
+        """Compiled version for Linux with Triton support."""
+        return compute_scale_shift_invariant_depth_loss_optimized(pred_depth, gt_depth, mask, stride=stride, use_fp16=True)
+else:
+    # Windows: Fallback version without Triton
+    def compute_scale_shift_invariant_depth_loss_compiled(pred_depth, gt_depth, mask, stride=2):
+        """Fallback version for Windows without Triton."""
+        return compute_scale_shift_invariant_depth_loss_optimized(pred_depth, gt_depth, mask, stride=stride, use_fp16=True)
+
+
+def compute_gradient_loss(pred_depth, gt_depth, mask, scales=4):
     """
-    GPU-optimized depth loss: pure scale-shift invariant OR combined with direct MSE.
-    Now uses the 8.5x faster optimized implementation that maintains perfect accuracy.
+    Multi-scale gradient matching loss for sharp depth discontinuities.
+    Based on MiDaS paper: helps preserve edges in depth maps.
+    
+    Args:
+        pred_depth: Predicted depth [B, H, W]
+        gt_depth: Ground truth depth [B, H, W] 
+        mask: Valid pixel mask [B, H, W]
+        scales: Number of scales to use (default: 4)
+    
+    Returns:
+        Gradient loss value
+    """
+    device = pred_depth.device
+    total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    for scale in range(scales):
+        step = 2 ** scale
+        
+        # Subsample at current scale
+        pred_s = pred_depth[:, ::step, ::step]
+        gt_s = gt_depth[:, ::step, ::step]
+        mask_s = mask[:, ::step, ::step]
+        
+        # Skip if too small
+        if pred_s.size(1) < 2 or pred_s.size(2) < 2:
+            continue
+            
+        # Compute gradients in x and y directions
+        pred_grad_x = pred_s[:, :, 1:] - pred_s[:, :, :-1]  # [B, H, W-1]
+        pred_grad_y = pred_s[:, 1:, :] - pred_s[:, :-1, :]  # [B, H-1, W]
+        
+        gt_grad_x = gt_s[:, :, 1:] - gt_s[:, :, :-1]
+        gt_grad_y = gt_s[:, 1:, :] - gt_s[:, :-1, :]
+        
+        # Corresponding masks for gradients
+        mask_grad_x = mask_s[:, :, 1:] * mask_s[:, :, :-1]  # Both pixels must be valid
+        mask_grad_y = mask_s[:, 1:, :] * mask_s[:, :-1, :]
+        
+        # Compute L1 loss on gradients (more robust than L2)
+        loss_x = torch.abs(pred_grad_x - gt_grad_x) * mask_grad_x
+        loss_y = torch.abs(pred_grad_y - gt_grad_y) * mask_grad_y
+        
+        # Average over valid gradients
+        valid_x = torch.sum(mask_grad_x, dim=(1, 2)) + 1e-8
+        valid_y = torch.sum(mask_grad_y, dim=(1, 2)) + 1e-8
+        
+        scale_loss_x = torch.sum(loss_x, dim=(1, 2)) / valid_x
+        scale_loss_y = torch.sum(loss_y, dim=(1, 2)) / valid_y
+        
+        # Add to total (average across batch)
+        total_loss = total_loss + torch.mean(scale_loss_x) + torch.mean(scale_loss_y)
+    
+    # Average across scales
+    return total_loss / scales if scales > 0 else total_loss
+
+
+def compute_robust_depth_loss(pred_depth, gt_depth, mask, use_compiled=True, use_gradient_loss=True, alpha=0.5):
+    """
+    Main depth loss function with optional gradient regularization.
     
     Args:
         pred_depth: Predicted depth [B, H, W]
         gt_depth: Ground truth depth [B, H, W]
         mask: Valid pixel mask (foreground) [B, H, W]
-        use_direct_loss: If True, adds small direct MSE term (default: False for pure SSI)
-        direct_weight: Weight for direct MSE component (default: 0.1)
+        use_compiled: If True, uses compiled version when available
+        use_gradient_loss: If True, adds gradient regularization term
+        alpha: Weight for gradient regularization (default: 0.5)
     
     Returns:
-        total_loss: Combined loss (pure SSI if use_direct_loss=False)
+        total_loss: Combined depth loss (SSI + gradient regularization)
         ssi_loss: Scale-shift invariant component
-        direct_loss: Direct MSE component (zero if use_direct_loss=False)
+        gradient_loss: Gradient regularization component (zero if disabled)
     """
-    # Primary loss: GPU-optimized scale-shift invariant in depth space
-    ssi_loss = compute_scale_shift_invariant_depth_loss(pred_depth, gt_depth, mask)
-    
-    if use_direct_loss:
-        # Optional: small direct depth loss to prevent scale drift
-        direct_loss = compute_masked_mse_loss(pred_depth, gt_depth, mask)
-        total_loss = ssi_loss + direct_weight * direct_loss
+    # Compute scale-shift invariant loss
+    if use_compiled and TRITON_AVAILABLE:
+        # Linux: Use compiled version with Triton
+        ssi_loss = compute_scale_shift_invariant_depth_loss_compiled(pred_depth, gt_depth, mask, stride=2)
     else:
-        # Pure scale-shift invariant loss
-        direct_loss = torch.tensor(0.0, device=pred_depth.device)
+        # Windows: Use optimized version without compilation
+        ssi_loss = compute_scale_shift_invariant_depth_loss_optimized(pred_depth, gt_depth, mask, stride=2, use_fp16=True)
+    
+    # Compute gradient regularization loss if enabled
+    if use_gradient_loss and alpha > 0:
+        gradient_loss = compute_gradient_loss(pred_depth, gt_depth, mask, scales=4)
+        total_loss = ssi_loss + alpha * gradient_loss
+    else:
+        gradient_loss = torch.tensor(0.0, device=pred_depth.device)
         total_loss = ssi_loss
     
-    return total_loss, ssi_loss, direct_loss
+    return total_loss, ssi_loss, gradient_loss
 
 
 def compute_surface_normal_loss(pred_normals, gt_normals, mask):
@@ -232,143 +356,38 @@ def compute_alpha_loss(alpha_logits, alpha_gt):
     return total_alpha_loss, bce_loss, l1_loss, dice_loss_val
 
 
-def compute_gradient_loss(pred, target, mask):
-    """
-    Compute gradient loss for sharper boundaries (optional enhancement).
-    Based on Sobel edge detection applied to depth predictions.
-    
-    Args:
-        pred: Predicted values [B, H, W]
-        target: Ground truth values [B, H, W] 
-        mask: Valid pixel mask [B, H, W]
-    
-    Returns:
-        Gradient loss
-    """
-    # Sobel filters for gradients
-    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                          dtype=torch.float32, device=pred.device)
-    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                          dtype=torch.float32, device=pred.device)
-    
-    # Add batch and channel dimensions for conv2d
-    sobel_x = sobel_x.view(1, 1, 3, 3)
-    sobel_y = sobel_y.view(1, 1, 3, 3)
-    
-    # Compute gradients
-    grad_pred_x = F.conv2d(pred.unsqueeze(1), sobel_x, padding=1)
-    grad_pred_y = F.conv2d(pred.unsqueeze(1), sobel_y, padding=1)
-    
-    grad_target_x = F.conv2d(target.unsqueeze(1), sobel_x, padding=1)
-    grad_target_y = F.conv2d(target.unsqueeze(1), sobel_y, padding=1)
-    
-    # Compute gradient loss
-    grad_loss_x = compute_masked_mse_loss(grad_pred_x.squeeze(1), grad_target_x.squeeze(1), mask)
-    grad_loss_y = compute_masked_mse_loss(grad_pred_y.squeeze(1), grad_target_y.squeeze(1), mask)
-    
-    return grad_loss_x + grad_loss_y
-
-
-def compute_enhanced_depth_loss(pred_depth, gt_depth, mask, use_gradient_loss=False, grad_weight=0.5):
-    """
-    Enhanced depth loss with optional gradient supervision.
-    
-    Args:
-        pred_depth: Predicted depth [B, H, W]
-        gt_depth: Ground truth depth [B, H, W]
-        mask: Valid pixel mask [B, H, W]
-        use_gradient_loss: Whether to include gradient supervision
-        grad_weight: Weight for gradient loss component
-    
-    Returns:
-        total_loss: Combined loss
-        ssi_loss: Scale-shift invariant component
-        direct_loss: Direct MSE component
-        grad_loss: Gradient loss component (if enabled)
-    """
-    # Base robust depth loss
-    total_loss, ssi_loss, direct_loss = compute_robust_depth_loss(pred_depth, gt_depth, mask)
-    
-    grad_loss = torch.tensor(0.0, device=pred_depth.device)
-    
-    if use_gradient_loss:
-        # Add gradient supervision for sharper boundaries
-        grad_loss = compute_gradient_loss(pred_depth, gt_depth, mask)
-        total_loss = total_loss + grad_weight * grad_loss
-    
-    if use_gradient_loss:
-        return total_loss, ssi_loss, direct_loss, grad_loss
-    else:
-        return total_loss, ssi_loss, direct_loss
-
-
-# Loss function registry for easy selection
-LOSS_FUNCTIONS = {
-    'depth': {
-        'mse': compute_masked_mse_loss,
-        'robust': compute_robust_depth_loss,
-        'enhanced': compute_enhanced_depth_loss,
-        'ssi': compute_scale_shift_invariant_depth_loss,
-    },
-    'normals': {
-        'cosine': compute_surface_normal_loss,
-    },
-    'alpha': {
-        'combined': compute_alpha_loss,
-        'bce': lambda logits, gt: nn.BCEWithLogitsLoss()(logits, gt),
-        'dice': lambda pred_probs, gt: dice_loss(pred_probs, gt),
-    }
-}
-
-
-def get_loss_function(task, loss_type):
-    """
-    Get a specific loss function by task and type.
-    
-    Args:
-        task: 'depth', 'normals', or 'alpha'
-        loss_type: specific loss variant
-    
-    Returns:
-        Loss function
-    """
-    if task not in LOSS_FUNCTIONS:
-        raise ValueError(f"Unknown task: {task}")
-    
-    if loss_type not in LOSS_FUNCTIONS[task]:
-        raise ValueError(f"Unknown loss type '{loss_type}' for task '{task}'")
-    
-    return LOSS_FUNCTIONS[task][loss_type]
-
-
 if __name__ == "__main__":
     # Test loss functions
-    print("Testing loss functions...")
+    print("🧪 Testing cleaned up loss functions...")
+    print(f"🔥 Triton available: {TRITON_AVAILABLE}")
     
     # Create dummy data
-    B, H, W = 2, 64, 64
-    pred_depth = torch.randn(B, H, W, requires_grad=True) * 10 + 5
-    gt_depth = torch.randn(B, H, W) * 10 + 5
-    mask = torch.rand(B, H, W) > 0.3
+    B, H, W = 2, 384, 384
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    pred_normals = torch.randn(B, 3, H, W, requires_grad=True)
-    gt_normals = torch.randn(B, 3, H, W)
+    pred_depth = torch.randn(B, H, W, device=device, requires_grad=True) * 5 + 10
+    gt_depth = torch.randn(B, H, W, device=device) * 5 + 10
+    mask = torch.rand(B, H, W, device=device) > 0.3
     
-    alpha_logits = torch.randn(B, H, W, requires_grad=True)
-    alpha_gt = torch.rand(B, H, W)
+    pred_normals = torch.randn(B, 3, H, W, device=device, requires_grad=True)
+    gt_normals = torch.randn(B, 3, H, W, device=device)
     
-    # Test depth losses
-    print(f"Masked MSE Loss: {compute_masked_mse_loss(pred_depth, gt_depth, mask):.4f}")
+    alpha_logits = torch.randn(B, H, W, device=device, requires_grad=True)
+    alpha_gt = torch.rand(B, H, W, device=device)
     
-    robust_loss, ssi_loss, direct_loss = compute_robust_depth_loss(pred_depth, gt_depth, mask)
-    print(f"Robust Depth Loss - Total: {robust_loss:.4f}, SSI: {ssi_loss:.4f}, Direct: {direct_loss:.4f}")
+    # Test depth loss
+    print("🔍 Testing depth loss...")
+    depth_loss, ssi_loss, direct_loss = compute_robust_depth_loss(pred_depth, gt_depth, mask)
+    print(f"   Depth Loss: {depth_loss:.4f}")
     
     # Test normal loss
+    print("🔍 Testing normal loss...")
     normal_loss = compute_surface_normal_loss(pred_normals, gt_normals, mask)
-    print(f"Surface Normal Loss: {normal_loss:.4f}")
+    print(f"   Normal Loss: {normal_loss:.4f}")
     
     # Test alpha loss
+    print("🔍 Testing alpha loss...")
     alpha_loss, bce_loss, l1_loss, dice_loss_val = compute_alpha_loss(alpha_logits, alpha_gt)
-    print(f"Alpha Loss - Total: {alpha_loss:.4f}, BCE: {bce_loss:.4f}, L1: {l1_loss:.4f}, Dice: {dice_loss_val:.4f}")
+    print(f"   Alpha Loss: {alpha_loss:.4f}")
     
     print("✅ All loss functions working correctly!")
